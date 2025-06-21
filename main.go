@@ -7,7 +7,7 @@ import (
 	"fmt"          // Digunakan untuk pemformatan input/output
 	"log"          // Digunakan untuk logging error
 	"math/big"     // Digunakan untuk operasi bilangan bulat besar (dibutuhkan untuk nilai blockchain seperti amount, gas)
-	"os"           // Digunakan untuk berinteraksi dengan sistem operasi (misalnya membaca variabel lingkungan)
+	"os"           // Digunakan untuk berinteraksi dengan sistem operasi (misalnya membaca variabel lingkungan, file)
 	"strconv"      // Diperlukan untuk konversi string ke tipe numerik
 	"strings"      // Diperlukan untuk manipulasi string (misalnya menghilangkan prefiks "0x")
 	"sync"         // Diperlukan untuk sync.WaitGroup
@@ -23,9 +23,32 @@ import (
 	"github.com/joho/godotenv"                          // Pustaka untuk memuat variabel lingkungan dari file .env
 )
 
+// loadPrivateKeysFromFile membaca private key dari file, satu per baris.
+func loadPrivateKeysFromFile(filename string) ([]string, error) {
+	file, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("gagal membuka file private keys '%s': %v", filename, err)
+	}
+	defer file.Close()
+
+	var privateKeys []string
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		key := strings.TrimSpace(scanner.Text())
+		if key != "" { // Hanya tambahkan baris yang tidak kosong
+			privateKeys = append(privateKeys, key)
+		}
+	}
+
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("gagal membaca file private keys: %v", err)
+	}
+
+	return privateKeys, nil
+}
+
 func main() {
 	// Memuat variabel lingkungan dari file .env
-	// Ini memungkinkan aplikasi membaca konfigurasi sensitif dari file terpisah.
 	err := godotenv.Load()
 	if err != nil {
 		log.Fatalf("Kesalahan fatal: Gagal memuat file .env: %v", err)
@@ -38,7 +61,6 @@ func main() {
 	}
 
 	// Menghubungkan ke klien Ethereum menggunakan URL RPC
-	// Klien ini adalah jembatan antara aplikasi Go dan blockchain Avalanche.
 	client, err := ethclient.Dial(rpcURL)
 	if err != nil {
 		log.Fatalf("Kesalahan fatal: Gagal terhubung ke klien Ethereum di %s: %v", rpcURL, err)
@@ -60,19 +82,15 @@ func main() {
 	routerContractAddress := common.HexToAddress(routerContractAddressStr)
 	wavaxContractAddress := common.HexToAddress(wavaxContractAddressStr)
 
-	// Mengumpulkan semua private key dari variabel lingkungan
-	privateKeys := []string{}
-	for i := 1; ; i++ {
-		key := os.Getenv(fmt.Sprintf("PRIVATE_KEY_%d", i))
-		if key == "" {
-			break // Berhenti jika tidak ada lagi private key dengan pola PRIVATE_KEY_N
-		}
-		privateKeys = append(privateKeys, key)
+	// --- Mengumpulkan semua private key dari file private_keys.txt ---
+	privateKeys, err := loadPrivateKeysFromFile("private_keys.txt")
+	if err != nil {
+		log.Fatalf("Kesalahan fatal: %v", err)
 	}
 
 	// Memeriksa apakah ada private key yang ditemukan
 	if len(privateKeys) == 0 {
-		log.Fatal("Kesalahan fatal: Tidak ada private key yang ditemukan di .env. Pastikan Anda telah mengatur PRIVATE_KEY_1, PRIVATE_KEY_2, dll.")
+		log.Fatal("Kesalahan fatal: Tidak ada private key yang ditemukan di 'private_keys.txt'. Pastikan file ada dan berisi private key.")
 	}
 
 	// Membaca MAX_WALLET_PROCESS dari .env
@@ -100,7 +118,6 @@ func main() {
 
 		switch pilihan {
 		case "1":
-			// Proses cek saldo AVAX secara sequential (tidak perlu konkurensi berat)
 			for i, pk := range privateKeys {
 				if pk == "" {
 					continue
@@ -117,7 +134,6 @@ func main() {
 				}
 			}
 		case "2":
-			// Proses cek saldo ARENA secara sequential (tidak perlu konkurensi berat)
 			for i, pk := range privateKeys {
 				if pk == "" {
 					continue
@@ -137,7 +153,6 @@ func main() {
 			fmt.Printf("\nMemulai proses penjualan token ARENA dari semua dompet (konkurensi: %d dompet sekaligus)...\n", maxWalletProcess)
 
 			// Semaphore channel untuk membatasi konkurensi
-			// Buffer channel berukuran maxWalletProcess akan membatasi goroutine yang berjalan bersamaan
 			semaphore := make(chan struct{}, maxWalletProcess)
 			var wg sync.WaitGroup // WaitGroup untuk menunggu semua goroutine selesai
 
@@ -243,7 +258,9 @@ func sellARENAToken(client *ethclient.Client, privateKeyHex string, arenaContrac
 		if err != nil {
 			return fmt.Errorf("kesalahan parsing MAX_FEE_PER_GAS_GWEI: %v", err)
 		}
-		maxFeePerGas = big.NewInt(0).SetUint64(uint64(maxFeePerGasFloat * 1e9)) // Konversi Gwei ke Wei
+		// Konversi Gwei ke Wei (1 Gwei = 10^9 Wei)
+		// Menggunakan big.Int untuk menghindari masalah presisi floating point
+		maxFeePerGas = new(big.Int).SetUint64(uint64(maxFeePerGasFloat * 1e9))
 	} else {
 		// Fallback ke harga gas yang disarankan jika MAX_FEE_PER_GAS_GWEI tidak diatur
 		// Atau Anda bisa menggunakan nilai default yang aman jika tidak disetel
@@ -263,7 +280,8 @@ func sellARENAToken(client *ethclient.Client, privateKeyHex string, arenaContrac
 		if err != nil {
 			return fmt.Errorf("kesalahan parsing MAX_PRIORITY_FEE_PER_GAS_GWEI: %v", err)
 		}
-		maxPriorityFeePerGas = big.NewInt(0).SetUint64(uint64(maxPriorityFeePerGasFloat * 1e9)) // Konversi Gwei ke Wei
+		// Konversi Gwei ke Wei
+		maxPriorityFeePerGas = new(big.Int).SetUint64(uint64(maxPriorityFeePerGasFloat * 1e9))
 	} else {
 		// Fallback ke nilai default jika MAX_PRIORITY_FEE_PER_GAS_GWEI tidak diatur
 		// Umumnya, 1 Gwei atau lebih rendah sudah cukup sebagai tip

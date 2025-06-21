@@ -10,6 +10,7 @@ import (
 	"os"           // Digunakan untuk berinteraksi dengan sistem operasi (misalnya membaca variabel lingkungan)
 	"strconv"      // Diperlukan untuk konversi string ke tipe numerik
 	"strings"      // Diperlukan untuk manipulasi string (misalnya menghilangkan prefiks "0x")
+	"sync"         // Diperlukan untuk sync.WaitGroup
 	"time"         // Digunakan untuk operasi terkait waktu (misalnya deadline transaksi)
 
 	"arena-seller/contracts" // Impor paket kontrak yang sudah dihasilkan oleh abigen
@@ -74,6 +75,14 @@ func main() {
 		log.Fatal("Kesalahan fatal: Tidak ada private key yang ditemukan di .env. Pastikan Anda telah mengatur PRIVATE_KEY_1, PRIVATE_KEY_2, dll.")
 	}
 
+	// Membaca MAX_WALLET_PROCESS dari .env
+	maxWalletProcessStr := os.Getenv("MAX_WALLET_PROCESS")
+	maxWalletProcess, err := strconv.Atoi(maxWalletProcessStr)
+	if err != nil || maxWalletProcess <= 0 {
+		log.Printf("Peringatan: MAX_WALLET_PROCESS tidak diatur atau tidak valid (%s). Menggunakan default 1 (sequential).\n", maxWalletProcessStr)
+		maxWalletProcess = 1 // Default ke sequential jika tidak valid
+	}
+
 	reader := bufio.NewReader(os.Stdin)
 
 	for {
@@ -91,6 +100,7 @@ func main() {
 
 		switch pilihan {
 		case "1":
+			// Proses cek saldo AVAX secara sequential (tidak perlu konkurensi berat)
 			for i, pk := range privateKeys {
 				if pk == "" {
 					continue
@@ -107,6 +117,7 @@ func main() {
 				}
 			}
 		case "2":
+			// Proses cek saldo ARENA secara sequential (tidak perlu konkurensi berat)
 			for i, pk := range privateKeys {
 				if pk == "" {
 					continue
@@ -123,22 +134,38 @@ func main() {
 				}
 			}
 		case "3":
-			fmt.Println("\nMemulai proses penjualan token ARENA dari semua dompet...")
+			fmt.Printf("\nMemulai proses penjualan token ARENA dari semua dompet (konkurensi: %d dompet sekaligus)...\n", maxWalletProcess)
+
+			// Semaphore channel untuk membatasi konkurensi
+			// Buffer channel berukuran maxWalletProcess akan membatasi goroutine yang berjalan bersamaan
+			semaphore := make(chan struct{}, maxWalletProcess)
+			var wg sync.WaitGroup // WaitGroup untuk menunggu semua goroutine selesai
+
 			for i, pk := range privateKeys {
 				if pk == "" {
 					log.Printf("Peringatan: Melewatkan dompet %d karena private key kosong.\n", i+1)
 					continue
 				}
 
-				fmt.Printf("\n--- Memproses Dompet #%d ---\n", i+1)
-				err := sellARENAToken(client, pk, arenaContractAddress, routerContractAddress, wavaxContractAddress)
-				if err != nil {
-					log.Printf("Gagal menjual ARENA dari dompet #%d: %v\n", i+1, err)
-				} else {
-					fmt.Printf("Berhasil menginisiasi transaksi jual untuk dompet #%d.\n", i+1)
-				}
-				time.Sleep(2 * time.Second) // Jeda antar dompet
+				wg.Add(1)               // Menambah counter WaitGroup
+				semaphore <- struct{}{} // Mengakuisisi slot dari semaphore (akan memblokir jika penuh)
+
+				go func(walletIndex int, privateKey string) {
+					defer wg.Done()                // Menandai goroutine selesai saat exit
+					defer func() { <-semaphore }() // Melepaskan slot semaphore setelah selesai
+
+					fmt.Printf("\n--- Memproses Dompet #%d ---\n", walletIndex+1)
+					err := sellARENAToken(client, privateKey, arenaContractAddress, routerContractAddress, wavaxContractAddress)
+					if err != nil {
+						log.Printf("Gagal menjual ARENA dari dompet #%d: %v\n", walletIndex+1, err)
+					} else {
+						fmt.Printf("Berhasil menginisiasi transaksi jual untuk dompet #%d.\n", walletIndex+1)
+					}
+					// Jeda singkat antar proses dompet untuk membantu RPC atau mencegah overload
+					time.Sleep(1 * time.Second)
+				}(i, pk)
 			}
+			wg.Wait() // Tunggu semua goroutine selesai
 			fmt.Println("\nProses penjualan token selesai.")
 		case "4":
 			fmt.Println("Keluar dari aplikasi. Sampai jumpa!")
